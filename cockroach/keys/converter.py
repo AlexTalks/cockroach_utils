@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
+"""
+Utility for converting CockroachDB Keys.
 
-from typing import Generator, List, Text
-
-from bidict import bidict, MutableBidict
+NB: This code is EXTREMELY untested and is likely incorrect in many ways.
+As such, it should NOT be used as a reference of any kind.
+"""
+from bidict import bidict, MutableBidict, ON_DUP_DROP_OLD
 import sys
+from typing import Dict, Generator, List, Text
 
-from cockroach.keys import constants
-from cockroach.keys.keys import Key, KeyBuffer
+from . import Key, KeyBuffer
+from cockroach.keys import constants, encoding
 
 SEPARATOR = "/"
 TODO_KEY = Key(0x70D0.to_bytes(2, byteorder=sys.byteorder))
 TODO_TABLE_KEY = Key(0x7AB1EE.to_bytes(3, byteorder=sys.byteorder))
 UNSUPPORTED_KEY = Key(0xDEADBEEF.to_bytes(4, byteorder=sys.byteorder))
 
-KEY_DICT: MutableBidict[Text, Key] = bidict({
+KEY_DICT: Dict[Text, Key] = {
     "Min": constants.KEY_MIN,
     "Max": constants.KEY_MAX,
     "Local": constants.PrefixByte.LOCAL,
@@ -44,15 +48,18 @@ KEY_DICT: MutableBidict[Text, Key] = bidict({
 
     # TODO(sarkesian): support Tenant keys
     "Tenant": UNSUPPORTED_KEY,
-})
+}
+
+BI_KEY_DICT: MutableBidict[Text, Key] = bidict()
+BI_KEY_DICT.putall(KEY_DICT, on_dup=ON_DUP_DROP_OLD)
 
 
 def key_to_str(key: Key) -> Text:
     parts: List[Text] = ['']
 
     for byte_part in sep_bytes(key):
-        if byte_part in KEY_DICT.inverse:
-            parts.append(KEY_DICT.inverse[byte_part])
+        if byte_part in BI_KEY_DICT.inverse:
+            parts.append(BI_KEY_DICT.inverse[byte_part])
         else:
             raise Exception("unknown byte")
 
@@ -78,19 +85,10 @@ def sep_bytes(key: Key) -> Generator[Key, None, None]:
 
 
 def str_to_key(str_key: Text) -> Key:
-    parts = str_key.split(SEPARATOR)
     buf = KeyBuffer()
 
-    for key_part in parts:
-        if not key_part:
-            continue
-        mapped_bytes = KEY_DICT.get(key_part, TODO_KEY)
-        if mapped_bytes not in {TODO_KEY, TODO_TABLE_KEY}:
-            buf.extend(mapped_bytes)
-        elif mapped_bytes == TODO_TABLE_KEY:
-            pass
-        elif mapped_bytes == TODO_KEY:
-            raise Exception("unhandled key type")
+    for key_bytes in sep_key_parts(str_key):
+        buf.extend(key_bytes)
 
     return Key(buf)
 
@@ -100,7 +98,7 @@ def sep_key_parts(str_key: Text) -> Generator[Key, None, None]:
     unyielded: List[Text] = []
 
     def table_in_progress() -> bool:
-        return unyielded and unyielded[0] == "Table"
+        return bool(unyielded and unyielded[0] == "Table")
 
     for key_part in parts:
         if not key_part:
@@ -114,19 +112,36 @@ def sep_key_parts(str_key: Text) -> Generator[Key, None, None]:
             continue
         elif mapped_bytes == TODO_KEY:
             if table_in_progress():
-                if len(unyielded) < 3:
+                if len(unyielded) < 2:
                     unyielded.append(key_part)
                 else:
-                    yield parse_table(unyielded[1], unyielded[2])
+                    yield parse_table(unyielded[1], key_part)
                     unyielded = unyielded[2:]
             else:
-                # parse normal stuff in keys, possibly quoted
-                pass
+                yield encoding.encode_string(Key(), key_part.strip('"'))
         else:
             raise Exception("unhandled key type")
+
+    if table_in_progress():
+        if len(unyielded) == 2:
+            yield parse_table(unyielded[1], "")
+            unyielded = unyielded[2:]
+        else:
+            raise Exception("Incorrectly formed table key")
+
+    if unyielded:
+        raise Exception("malformed key")
 
     return
 
 
 def parse_table(table_id_str: Text, index_id_str: Text) -> Key:
-    pass
+    buf = KeyBuffer()
+    table_id = int(table_id_str)
+    buf = encoding.encode_varint(buf, table_id)
+
+    if len(index_id_str):
+        index_id = int(index_id_str)
+        buf = encoding.encode_varint(buf, index_id)
+
+    return Key(buf)

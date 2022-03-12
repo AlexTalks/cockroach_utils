@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
-from typing import List
-
-from cockroach.keys.keys import make_key
+from . import make_key
 
 
 class PrefixByte:
